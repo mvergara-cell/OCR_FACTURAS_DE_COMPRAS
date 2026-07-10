@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Extractor de Facturas PDF → Base de Datos</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --bg:#faf9f7; --panel:#ffffff; --border:#e2ddd5; --ink:#2b2620; --muted:#7a7268;
+    --accent:#c15f3c; --accent-dark:#a34c2d; --ok:#3f7a4e; --warn:#b8862f; --err:#b8452f;
+    --tableline:#eee7dc;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background:var(--bg); color:var(--ink); margin:0; padding:24px;
+  }
+  h1{font-size:20px; margin:0 0 4px 0;}
+  .subtitle{color:var(--muted); font-size:13px; margin-bottom:20px;}
+  .panel{background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px; margin-bottom:18px;}
+  #dropzone{
+    border:2px dashed var(--border); border-radius:10px; padding:32px; text-align:center;
+    color:var(--muted); cursor:pointer; transition:border-color .15s, background .15s;
+  }
+  #dropzone.drag{border-color:var(--accent); background:#fdf3ee;}
+  #dropzone strong{color:var(--accent-dark);}
+  #fileInput{display:none;}
+  .toolbar{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:14px;}
+  button{
+    font-family:inherit; font-size:13px; border:1px solid var(--border); background:#fff;
+    color:var(--ink); padding:8px 14px; border-radius:7px; cursor:pointer;
+  }
+  button:hover{border-color:var(--accent);}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  button.primary:hover{background:var(--accent-dark);}
+  button:disabled{opacity:.4; cursor:not-allowed;}
+  #log{font-size:12.5px; color:var(--muted); margin-top:10px; max-height:120px; overflow:auto;}
+  #log div{padding:2px 0;}
+  #log .ok{color:var(--ok);}
+  #log .err{color:var(--err);}
+  #log .warn{color:var(--warn);}
+  .summary{display:flex; gap:24px; font-size:13px; color:var(--muted); margin-bottom:6px;}
+  .summary b{color:var(--ink); font-size:15px;}
+  table{border-collapse:collapse; width:100%; font-size:12.5px;}
+  th, td{border:1px solid var(--tableline); padding:6px 8px; text-align:left; vertical-align:top;}
+  th{background:#f5f0e8; position:sticky; top:0; white-space:nowrap; font-weight:600;}
+  td[contenteditable="true"]{cursor:text;}
+  td[contenteditable="true"]:focus{outline:2px solid var(--accent); outline-offset:-2px;}
+  .num{text-align:right; white-space:nowrap;}
+  .tablewrap{overflow:auto; max-height:70vh; border:1px solid var(--tableline); border-radius:8px;}
+  .rowfile{font-size:11px; color:var(--muted);}
+  .del{color:var(--err); cursor:pointer; font-size:11px; text-decoration:underline;}
+  .badge{display:inline-block; font-size:10px; padding:1px 6px; border-radius:10px; background:#eee; color:#666;}
+  .badge.ok{background:#e6f2e8; color:var(--ok);}
+  .badge.warn{background:#fbf1e0; color:var(--warn);}
+  details summary{cursor:pointer; color:var(--accent-dark); font-size:12px;}
+  details pre{white-space:pre-wrap; font-size:11px; max-height:200px; overflow:auto; background:#faf9f7; padding:8px; border-radius:6px;}
+  footer{color:var(--muted); font-size:11.5px; margin-top:10px;}
+</style>
+</head>
+<body>
+
+<h1>Extractor de Facturas PDF → Base de datos</h1>
+<div class="subtitle">Arrastra tus PDF de compras (facturas electrónicas SUNAT). Se procesan localmente en el navegador — no se suben a ningún servidor.</div>
+
+<div class="panel">
+  <div id="dropzone">
+    <div><strong>Arrastra archivos PDF aquí</strong> o haz clic para seleccionarlos</div>
+    <div style="font-size:12px;margin-top:6px;">Puedes soltar varios archivos a la vez</div>
+  </div>
+  <input type="file" id="fileInput" accept="application/pdf" multiple>
+  <div class="toolbar">
+    <button class="primary" id="btnAdd">Añadir PDFs</button>
+    <button id="btnCsv" disabled>Exportar CSV</button>
+    <button id="btnXlsx" disabled>Exportar Excel</button>
+    <button id="btnJson" disabled>Guardar sesión (JSON)</button>
+    <button id="btnLoadJson">Cargar sesión (JSON)</button>
+    <button id="btnClear" disabled>Limpiar todo</button>
+    <input type="file" id="jsonInput" accept="application/json" style="display:none">
+  </div>
+  <div id="log"></div>
+</div>
+
+<div class="panel" id="resultsPanel" style="display:none;">
+  <div class="summary">
+    <div>Documentos: <b id="sumCount">0</b></div>
+    <div>Líneas de producto: <b id="sumLines">0</b></div>
+    <div>Total facturado: <b id="sumTotal">S/ 0.00</b></div>
+    <div>IGV acumulado: <b id="sumIgv">S/ 0.00</b></div>
+  </div>
+  <div class="tablewrap">
+    <table id="dbTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Archivo</th>
+          <th>Tipo doc.</th>
+          <th>N° Documento</th>
+          <th>Fecha emisión</th>
+          <th>Proveedor</th>
+          <th>RUC proveedor</th>
+          <th>Cliente</th>
+          <th>RUC cliente</th>
+          <th>Forma de pago</th>
+          <th>Moneda</th>
+          <th>Cantidad</th>
+          <th>Unidad</th>
+          <th>Código</th>
+          <th>Descripción producto</th>
+          <th class="num">Valor unitario</th>
+          <th class="num">Importe línea</th>
+          <th class="num">Sub total factura</th>
+          <th class="num">IGV factura</th>
+          <th class="num">Importe total factura</th>
+          <th>Monto en letras</th>
+          <th class="num">% Detracción</th>
+          <th class="num">Monto detracción</th>
+          <th>Texto</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="dbBody"></tbody>
+    </table>
+  </div>
+  <footer>Cada producto/línea de una factura aparece como una fila independiente. Los campos son editables: haz clic sobre cualquier celda para corregirla. Editar un campo de cabecera (proveedor, fecha, totales, etc.) lo actualiza en todas las líneas de esa misma factura.</footer>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+let records = []; // una fila por producto/ítem: {id, docId, archivo, texto, campos:{...cabecera + ítem}}
+let idCounter = 1;
+let docCounter = 1;
+
+const HEADER_FIELDS = ['tipoDocumento','numeroDocumento','fechaEmision','proveedorNombre','proveedorRuc',
+  'clienteNombre','clienteRuc','formaPago','moneda','subTotal','igv','importeTotal','montoLetras',
+  'detraccionPct','detraccionMonto'];
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const jsonInput = document.getElementById('jsonInput');
+const logEl = document.getElementById('log');
+
+function log(msg, cls){
+  const d = document.createElement('div');
+  d.className = cls || '';
+  d.textContent = msg;
+  logEl.prepend(d);
+}
+
+dropzone.addEventListener('click', () => fileInput.click());
+document.getElementById('btnAdd').addEventListener('click', () => fileInput.click());
+['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
+dropzone.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+fileInput.addEventListener('change', e => { handleFiles(e.target.files); fileInput.value=''; });
+
+document.getElementById('btnClear').addEventListener('click', () => {
+  if(!confirm('¿Borrar todos los documentos cargados?')) return;
+  records = [];
+  renderTable();
+});
+
+document.getElementById('btnLoadJson').addEventListener('click', () => jsonInput.click());
+jsonInput.addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if(!f) return;
+  try{
+    const text = await f.text();
+    const data = JSON.parse(text);
+    if(Array.isArray(data)){
+      const docMap = new Map();
+      data.forEach(r => {
+        if(!docMap.has(r.docId)) docMap.set(r.docId, docCounter++);
+        records.push({ id: idCounter++, docId: docMap.get(r.docId), archivo: r.archivo, texto: r.texto, campos: r.campos });
+      });
+      renderTable();
+      log('Sesión cargada: ' + data.length + ' línea(s) desde ' + f.name, 'ok');
+    }
+  }catch(err){
+    log('No se pudo leer el archivo de sesión: ' + err.message, 'err');
+  }
+  jsonInput.value = '';
+});
+
+async function handleFiles(fileList){
+  const files = Array.from(fileList).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
+  if(files.length === 0){ log('No se detectaron archivos PDF válidos.', 'warn'); return; }
+  for(const file of files){
+    try{
+      log('Procesando ' + file.name + ' …');
+      const arrayBuffer = await file.arrayBuffer();
+      const text = await extractLayoutText(arrayBuffer);
+      const header = parseHeader(text);
+      let items = parseItems(text);
+      if(items.length === 0){
+        items = [{ cantidad:'', unidad:'', codigo:'', descripcion:'', valorUnitario:'' }];
+      }
+      const docId = docCounter++;
+      items.forEach(it => {
+        records.push({
+          id: idCounter++,
+          docId,
+          archivo: file.name,
+          texto: text,
+          campos: {
+            ...header,
+            itemCantidad: it.cantidad, itemUnidad: it.unidad, itemCodigo: it.codigo,
+            itemDescripcion: it.descripcion, itemValorUnitario: it.valorUnitario
+          }
+        });
+      });
+      log('✓ ' + file.name + ' — ' + (header.numeroDocumento || 'sin número detectado') + ' (' + items.length + ' línea(s))', 'ok');
+    }catch(err){
+      log('✗ Error procesando ' + file.name + ': ' + err.message, 'err');
+    }
+  }
+  renderTable();
+}
+
+// ---------- PDF text extraction with approximate layout reconstruction ----------
+async function extractLayoutText(arrayBuffer){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  let fullText = '';
+  for(let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const items = content.items
+      .map(it => ({ str: it.str, x: it.transform[4], y: it.transform[5], w: it.width || (it.str.length * 4) }))
+      .filter(it => it.str.trim() !== '');
+    items.sort((a,b) => b.y - a.y || a.x - b.x);
+
+    const Y_TOL = 3;
+    const lines = [];
+    let current = null;
+    for(const it of items){
+      if(current && Math.abs(current.y - it.y) <= Y_TOL){
+        current.items.push(it);
+      } else {
+        current = { y: it.y, items: [it] };
+        lines.push(current);
+      }
+    }
+    for(const line of lines){
+      line.items.sort((a,b) => a.x - b.x);
+      let lineText = '';
+      let lastEndX = null;
+      for(const it of line.items){
+        if(lastEndX !== null){
+          const gap = it.x - lastEndX;
+          lineText += gap > 18 ? '    ' : ' ';
+        }
+        lineText += it.str;
+        lastEndX = it.x + it.w;
+      }
+      fullText += lineText.trim() + '\n';
+    }
+    fullText += '\n';
+  }
+  return fullText;
+}
+
+// ---------- Field extraction ----------
+function field(text, re){
+  const m = text.match(re);
+  return m ? m[1].trim() : '';
+}
+
+function parseHeader(text){
+  const tipoDoc = field(text, /(FACTURA ELECTR[OÓ]NICA|BOLETA DE VENTA ELECTR[OÓ]NICA|NOTA DE CR[EÉ]DITO ELECTR[OÓ]NICA|NOTA DE D[EÉ]BITO ELECTR[OÓ]NICA)/i);
+
+  const rucMatches = [...text.matchAll(/RUC\s*:?\s*(\d{8,11})/gi)];
+  const proveedorRuc = rucMatches.length ? rucMatches[0][1] : '';
+
+  const senorIdx = text.search(/Se[nñ]or\(es\)/i);
+  let clienteRuc = '';
+  if(senorIdx >= 0){
+    const after = text.slice(senorIdx);
+    clienteRuc = field(after, /RUC\s*:?\s*(\d{8,11})/i);
+  }
+
+  const numeroDocumento = field(text, /\b([A-Z]\d{3}-\d{1,8})\b/);
+  const fechaEmision = field(text, /Fecha de Emisi[oó]n\s*:?\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+  const formaPago = field(text, /Forma de pago:?\s*([^\n]+)/i);
+  const clienteNombre = field(text, /Se[nñ]or\(es\)\s*:?\s*([^\n]+)/i);
+  const moneda = field(text, /Tipo de Moneda\s*:?\s*([^\n]+)/i);
+  const observacion = field(text, /Observaci[oó]n\s*:?\s*([^\n]*)/i);
+  const subTotal = field(text, /Sub ?Total Ventas\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
+  const igv = field(text, /\bIGV\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
+  const importeTotal = field(text, /Importe Total\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
+  let son = field(text, /SON:?\s*([^\n]+)/i);
+  son = son.split(/\s{2,}/)[0].trim();
+  const detraccionPct = field(text, /Porcentaje de detracci[oó]n:?\s*([\d.]+)/i);
+  const detraccionMonto = field(text, /Monto detracci[oó]n:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
+
+  // Nombre proveedor: líneas antes del primer RUC, sin el rótulo de tipo de documento
+  const lines = text.split('\n');
+  let provLines = [];
+  for(const line of lines){
+    if(/RUC\s*:?\s*\d{8,11}/i.test(line)) break;
+    const stripped = line
+      .replace(/FACTURA ELECTR[OÓ]NICA|BOLETA DE VENTA ELECTR[OÓ]NICA|NOTA DE (CR[EÉ]DITO|D[EÉ]BITO) ELECTR[OÓ]NICA/gi, '')
+      .trim();
+    if(stripped) provLines.push(stripped);
+  }
+  const proveedorNombre = provLines.join(' / ');
+
+  return {
+    tipoDocumento: tipoDoc || '',
+    numeroDocumento, fechaEmision, proveedorNombre, proveedorRuc,
+    clienteNombre, clienteRuc, formaPago, moneda, observacion,
+    subTotal, igv, importeTotal, montoLetras: son,
+    detraccionPct, detraccionMonto
+  };
+}
+
+// ---------- Parseo de ítems: separa la tabla de productos en filas individuales ----------
+function parseItems(text){
+  const startIdx = text.search(/Cantidad\s+Unidad Medida/i);
+  const endIdx = text.search(/Valor de Venta de Operaciones Gratuitas/i);
+  if(startIdx < 0 || endIdx <= startIdx) return [];
+
+  const block = text.slice(startIdx, endIdx)
+    .split('\n')
+    .slice(1)
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const items = [];
+  for(const line of block){
+    const parts = line.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+    const isNewItem = parts.length >= 1 && /^\d+(?:\.\d{1,4})?$/.test(parts[0]);
+
+    if(isNewItem){
+      let cantidad = parts[0], unidad = '', codigo = '', descripcion = '', valorUnitario = '';
+      const last = parts[parts.length - 1];
+      const lastIsNumber = /^[\d,]+\.\d{2,6}$/.test(last);
+
+      if(parts.length === 5){
+        unidad = parts[1]; codigo = parts[2]; descripcion = parts[3];
+        valorUnitario = lastIsNumber ? parts[4] : '';
+      } else if(parts.length === 4){
+        unidad = parts[1]; descripcion = parts[2];
+        valorUnitario = lastIsNumber ? parts[3] : '';
+      } else if(parts.length === 3){
+        unidad = parts[1];
+        valorUnitario = lastIsNumber ? parts[2] : '';
+      } else if(parts.length >= 6){
+        unidad = parts[1]; codigo = parts[2];
+        descripcion = parts.slice(3, -1).join(' ');
+        valorUnitario = lastIsNumber ? parts[parts.length - 1] : '';
+      } else {
+        descripcion = parts.slice(1).join(' ');
+      }
+      items.push({ cantidad, unidad, codigo, descripcion, valorUnitario });
+    } else if(items.length){
+      // línea de continuación: se agrega a la descripción del último ítem detectado
+      items[items.length - 1].descripcion = (items[items.length - 1].descripcion + ' ' + line).trim();
+    }
+  }
+  return items;
+}
+
+// ---------- Table rendering ----------
+function itemImporte(c){
+  if(!c.itemCantidad || !c.itemValorUnitario) return '';
+  const cant = parseFloat((c.itemCantidad || '').replace(/,/g,'')) || 0;
+  const vu = parseFloat((c.itemValorUnitario || '').replace(/,/g,'')) || 0;
+  return (cant * vu).toFixed(2);
+}
+
+function renderTable(){
+  const body = document.getElementById('dbBody');
+  const panel = document.getElementById('resultsPanel');
+  body.innerHTML = '';
+  panel.style.display = records.length ? 'block' : 'none';
+
+  records.forEach((r, idx) => {
+    const c = r.campos;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${idx+1}</td>
+      <td class="rowfile">${escapeHtml(r.archivo)}</td>
+      <td contenteditable="true" data-field="tipoDocumento">${escapeHtml(c.tipoDocumento)}</td>
+      <td contenteditable="true" data-field="numeroDocumento">${escapeHtml(c.numeroDocumento)}</td>
+      <td contenteditable="true" data-field="fechaEmision">${escapeHtml(c.fechaEmision)}</td>
+      <td contenteditable="true" data-field="proveedorNombre">${escapeHtml(c.proveedorNombre)}</td>
+      <td contenteditable="true" data-field="proveedorRuc">${escapeHtml(c.proveedorRuc)}</td>
+      <td contenteditable="true" data-field="clienteNombre">${escapeHtml(c.clienteNombre)}</td>
+      <td contenteditable="true" data-field="clienteRuc">${escapeHtml(c.clienteRuc)}</td>
+      <td contenteditable="true" data-field="formaPago">${escapeHtml(c.formaPago)}</td>
+      <td contenteditable="true" data-field="moneda">${escapeHtml(c.moneda)}</td>
+      <td class="num" contenteditable="true" data-field="itemCantidad">${escapeHtml(c.itemCantidad)}</td>
+      <td contenteditable="true" data-field="itemUnidad">${escapeHtml(c.itemUnidad)}</td>
+      <td contenteditable="true" data-field="itemCodigo">${escapeHtml(c.itemCodigo)}</td>
+      <td contenteditable="true" data-field="itemDescripcion" style="max-width:280px;">${escapeHtml(c.itemDescripcion)}</td>
+      <td class="num" contenteditable="true" data-field="itemValorUnitario">${escapeHtml(c.itemValorUnitario)}</td>
+      <td class="num">${escapeHtml(itemImporte(c))}</td>
+      <td class="num" contenteditable="true" data-field="subTotal">${escapeHtml(c.subTotal)}</td>
+      <td class="num" contenteditable="true" data-field="igv">${escapeHtml(c.igv)}</td>
+      <td class="num" contenteditable="true" data-field="importeTotal">${escapeHtml(c.importeTotal)}</td>
+      <td contenteditable="true" data-field="montoLetras">${escapeHtml(c.montoLetras)}</td>
+      <td class="num" contenteditable="true" data-field="detraccionPct">${escapeHtml(c.detraccionPct)}</td>
+      <td class="num" contenteditable="true" data-field="detraccionMonto">${escapeHtml(c.detraccionMonto)}</td>
+      <td><details><summary>ver</summary><pre>${escapeHtml(r.texto)}</pre></details></td>
+      <td><span class="del" data-id="${r.id}">eliminar</span></td>
+    `;
+    body.appendChild(tr);
+  });
+
+  body.querySelectorAll('td[contenteditable]').forEach(td => {
+    td.addEventListener('blur', e => {
+      const tr = e.target.closest('tr');
+      const idx = Array.from(body.children).indexOf(tr);
+      const rowField = e.target.getAttribute('data-field');
+      const value = e.target.textContent.trim();
+      const docId = records[idx].docId;
+      records[idx].campos[rowField] = value;
+      if(HEADER_FIELDS.includes(rowField)){
+        // Propaga el cambio a todas las líneas de la misma factura
+        records.forEach(r => { if(r.docId === docId) r.campos[rowField] = value; });
+      }
+      renderTable();
+    });
+  });
+
+  body.querySelectorAll('.del').forEach(el => {
+    el.addEventListener('click', e => {
+      const id = Number(e.target.getAttribute('data-id'));
+      records = records.filter(r => r.id !== id);
+      renderTable();
+    });
+  });
+
+  updateSummary();
+
+  const hasRecords = records.length > 0;
+  document.getElementById('btnCsv').disabled = !hasRecords;
+  document.getElementById('btnXlsx').disabled = !hasRecords;
+  document.getElementById('btnJson').disabled = !hasRecords;
+  document.getElementById('btnClear').disabled = !hasRecords;
+}
+
+function updateSummary(){
+  const seenDocs = new Set();
+  let totalSum = 0, igvSum = 0, docCount = 0;
+  records.forEach(r => {
+    if(!seenDocs.has(r.docId)){
+      seenDocs.add(r.docId);
+      docCount++;
+      totalSum += parseFloat((r.campos.importeTotal || '0').replace(/,/g,'')) || 0;
+      igvSum += parseFloat((r.campos.igv || '0').replace(/,/g,'')) || 0;
+    }
+  });
+  document.getElementById('sumCount').textContent = docCount;
+  document.getElementById('sumLines').textContent = records.length;
+  document.getElementById('sumTotal').textContent = 'S/ ' + totalSum.toFixed(2);
+  document.getElementById('sumIgv').textContent = 'S/ ' + igvSum.toFixed(2);
+}
+
+function escapeHtml(s){
+  return String(s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+// ---------- Export ----------
+const COLUMNS = [
+  ['archivo','Archivo'], ['tipoDocumento','Tipo doc.'], ['numeroDocumento','N° Documento'],
+  ['fechaEmision','Fecha emisión'], ['proveedorNombre','Proveedor'], ['proveedorRuc','RUC proveedor'],
+  ['clienteNombre','Cliente'], ['clienteRuc','RUC cliente'], ['formaPago','Forma de pago'],
+  ['moneda','Moneda'],
+  ['itemCantidad','Cantidad'], ['itemUnidad','Unidad'], ['itemCodigo','Código'],
+  ['itemDescripcion','Descripción producto'], ['itemValorUnitario','Valor unitario'], ['itemImporte','Importe línea'],
+  ['subTotal','Sub total factura'], ['igv','IGV factura'],
+  ['importeTotal','Importe total factura'], ['montoLetras','Monto en letras'],
+  ['detraccionPct','% Detracción'], ['detraccionMonto','Monto detracción']
+];
+
+function toRows(){
+  return records.map(r => {
+    const row = { archivo: r.archivo, ...r.campos, itemImporte: itemImporte(r.campos) };
+    return COLUMNS.map(([key]) => row[key] || '');
+  });
+}
+
+document.getElementById('btnCsv').addEventListener('click', () => {
+  const header = COLUMNS.map(c => c[1]);
+  const rows = toRows();
+  const csv = [header, ...rows].map(r => r.map(v => '"' + String(v).replace(/"/g,'""') + '"').join(',')).join('\n');
+  downloadBlob(new Blob(['﻿' + csv], {type:'text/csv;charset=utf-8'}), 'base_datos_facturas.csv');
+});
+
+document.getElementById('btnXlsx').addEventListener('click', () => {
+  const header = COLUMNS.map(c => c[1]);
+  const rows = toRows();
+  const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
+  ws['!cols'] = header.map(() => ({ wch: 20 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Facturas');
+  XLSX.writeFile(wb, 'base_datos_facturas.xlsx');
+});
+
+document.getElementById('btnJson').addEventListener('click', () => {
+  const data = records.map(({docId, archivo, texto, campos}) => ({docId, archivo, texto, campos}));
+  downloadBlob(new Blob([JSON.stringify(data, null, 2)], {type:'application/json'}), 'sesion_facturas.json');
+});
+
+function downloadBlob(blob, filename){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
