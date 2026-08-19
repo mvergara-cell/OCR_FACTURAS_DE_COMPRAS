@@ -196,7 +196,10 @@ async function handleFiles(fileList){
       let usadoOcr = false;
       if(text.replace(/\s/g, '').length < 20){
         log('  · ' + file.name + ' no tiene texto extraíble (parece una imagen escaneada) — usando OCR, puede tardar…', 'warn');
-        text = await ocrExtractText(arrayBuffer, file.name);
+        // pdf.js "transfiere" (detached) el ArrayBuffer usado en extractLayoutText, así que para el
+        // OCR necesitamos leer el archivo de nuevo y obtener un ArrayBuffer fresco, no el mismo.
+        const ocrBuffer = await file.arrayBuffer();
+        text = await ocrExtractText(ocrBuffer, file.name);
         usadoOcr = true;
       }
       const { header, items: rawItems, formato } = parseInvoice(text);
