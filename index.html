@@ -196,10 +196,7 @@ async function handleFiles(fileList){
       let usadoOcr = false;
       if(text.replace(/\s/g, '').length < 20){
         log('  · ' + file.name + ' no tiene texto extraíble (parece una imagen escaneada) — usando OCR, puede tardar…', 'warn');
-        // pdf.js "transfiere" (detached) el ArrayBuffer usado en extractLayoutText, así que para el
-        // OCR necesitamos leer el archivo de nuevo y obtener un ArrayBuffer fresco, no el mismo.
-        const ocrBuffer = await file.arrayBuffer();
-        text = await ocrExtractText(ocrBuffer, file.name);
+        text = await ocrExtractText(arrayBuffer, file.name);
         usadoOcr = true;
       }
       const { header, items: rawItems, formato } = parseInvoice(text);
@@ -231,8 +228,16 @@ async function handleFiles(fileList){
 }
 
 // ---------- PDF text extraction with approximate layout reconstruction ----------
+// pdf.js "transfiere" el ArrayBuffer que recibe hacia su worker interno, dejándolo
+// inutilizable (detached) para quien lo pasó. Como el mismo PDF se abre dos veces
+// (una para el texto y otra para el OCR), siempre se le entrega una COPIA propia,
+// de modo que el buffer original del archivo permanece intacto y reutilizable.
+function openPdf(arrayBuffer){
+  return pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+}
+
 async function extractLayoutText(arrayBuffer){
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const pdf = await openPdf(arrayBuffer);
   let fullText = '';
   for(let p = 1; p <= pdf.numPages; p++){
     const page = await pdf.getPage(p);
@@ -273,8 +278,9 @@ async function extractLayoutText(arrayBuffer){
 }
 
 // ---------- OCR (respaldo para PDFs escaneados sin capa de texto) ----------
-// Escala de renderizado ~280 DPI (pdf.js usa 72 DPI como base a escala 1).
-const OCR_SCALE = 280 / 72;
+// Resolución a la que se rasteriza el PDF antes del OCR (pdf.js usa 72 DPI a escala 1).
+const OCR_DPI = 280;
+const OCR_SCALE = OCR_DPI / 72;
 // Umbral de separación horizontal (en píxeles, a la escala anterior) para insertar
 // un marcador de "columna" en vez de un simple espacio entre palabras OCR.
 const OCR_GAP_PX = 40;
@@ -286,7 +292,12 @@ function getOcrWorker(){
       .then(async worker => {
         await worker.setParameters({
           tessedit_pageseg_mode: '4', // PSM.SINGLE_COLUMN — el que mejor funciona con estas facturas tabuladas
-          preserve_interword_spaces: '1'
+          preserve_interword_spaces: '1',
+          // CRÍTICO: un canvas no lleva metadatos de resolución, así que Tesseract asumiría
+          // 70 DPI. Con ese valor su análisis de columnas se pierde y descarta la columna
+          // "Cantidad", la de "Código" y los importes de la derecha (0 ítems, totales vacíos).
+          // Hay que declararle la resolución real a la que se rasterizó la página.
+          user_defined_dpi: String(OCR_DPI)
         });
         return worker;
       });
@@ -328,11 +339,12 @@ function reconstructFromOcrBlocks(blocks, gapPx){
 }
 
 async function ocrExtractText(arrayBuffer, fileName){
-  const worker = await getOcrWorker();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  let fullText = '';
+  // 1) Primero se rasterizan todas las páginas del PDF. Se hace ANTES de pedir el
+  //    motor de OCR para que, si algo falla con el PDF, el error salga de inmediato
+  //    y no después de esperar la descarga del motor.
+  const pdf = await openPdf(arrayBuffer);
+  const canvases = [];
   for(let p = 1; p <= pdf.numPages; p++){
-    log('  · OCR página ' + p + '/' + pdf.numPages + ' de ' + fileName + '…');
     const page = await pdf.getPage(p);
     const viewport = page.getViewport({ scale: OCR_SCALE });
     const canvas = document.createElement('canvas');
@@ -340,8 +352,18 @@ async function ocrExtractText(arrayBuffer, fileName){
     canvas.height = Math.ceil(viewport.height);
     const ctx = canvas.getContext('2d');
     await page.render({ canvasContext: ctx, viewport }).promise;
+    canvases.push(canvas);
+  }
 
-    const { data } = await worker.recognize(canvas, {}, { blocks: true });
+  // 2) Ahora sí, el motor de OCR. La primera vez debe descargar el motor y el modelo
+  //    de español (unos pocos MB); queda cacheado para los documentos siguientes.
+  if(!ocrWorkerPromise) log('  · Preparando el motor de OCR (solo la primera vez, puede tardar)…');
+  const worker = await getOcrWorker();
+
+  let fullText = '';
+  for(let i = 0; i < canvases.length; i++){
+    log('  · OCR página ' + (i + 1) + '/' + canvases.length + ' de ' + fileName + '…');
+    const { data } = await worker.recognize(canvases[i], {}, { blocks: true });
     fullText += reconstructFromOcrBlocks(data.blocks, OCR_GAP_PX) + '\n';
   }
   return fullText;
