@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<title>Extractor de Facturas PDF → Base de Datos</title>
+<title>Extractor de Facturas de Compras PDF → Base de Datos</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/7.0.0/tesseract.min.js"></script>
@@ -60,7 +60,7 @@
 </head>
 <body>
 
-<h1>Extractor de Facturas PDF → Base de datos</h1>
+<h1>Extractor de Facturas de Compras PDF → Base de datos</h1>
 <div class="subtitle">Arrastra tus PDF de compras (facturas electrónicas). Reconoce el formato SUNAT genérico y los formatos propios de HOLCIM, MEGA GAS / Costagas y COVEMA. Si un PDF no tiene texto (es una imagen escaneada), se usa OCR automáticamente — más lento y conviene revisar esas filas. Se procesan localmente en el navegador — no se suben a ningún servidor.</div>
 
 <div class="panel">
@@ -400,8 +400,12 @@ function labeledMultiline(lines, labelRe){
 }
 
 // Número de documento: admite 1 a 4 letras + dígitos - dígitos (E001-3591, FC65-00001678, F067-101079...)
+// Si eso falla, se acepta una serie sin dígitos (FBGB-4864); en ese caso se exige que
+// empiece por F/B/E/T (series de factura, boleta y nota) para no confundirla con textos
+// como "PLACA: Z51-800" que aparecen dentro de las descripciones.
 function extractNumeroDocumento(text){
-  return field(text, /\b([A-Z]{1,4}\d{1,4}-\d{2,8})\b/i);
+  return field(text, /\b([A-Z]{1,4}\d{1,4}-\d{2,8})\b/i)
+    || field(text, /\b([FBET][A-Z0-9]{3}-\d{1,8})\b/);
 }
 
 // ---------- Detección de formato / plantilla ----------
@@ -467,10 +471,13 @@ function parseHeaderSunat(text){
   clienteNombre = clienteNombre.split(/\s{2,}/)[0].trim();
   const moneda = field(text, /Tipo de Moneda\s*:?\s*([^\n]+)/i);
   const observacion = field(text, /Observaci[oó]n\s*:?\s*([^\n]*)/i);
-  const subTotal = field(text, /Sub ?Total Ventas\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i)
-    || field(text, /Total valor venta gravado\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
-  const igv = field(text, /\bIGV\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
-  const importeTotal = field(text, /Importe Total\s*:?\s*S\/\.?\s*([\d,]+\.\d{2})/i);
+  // Los importes pueden venir en soles (S/) o en dólares ($), así que el símbolo
+  // de moneda es opcional en todos los totales.
+  const CUR = '(?:S\\/\\.?|US\\$|\\$|€)?\\s*';
+  const subTotal = field(text, new RegExp('Sub ?Total Ventas\\s*:?\\s*' + CUR + '([\\d,]+\\.\\d{2})', 'i'))
+    || field(text, new RegExp('Total valor venta gravado\\s*:?\\s*' + CUR + '([\\d,]+\\.\\d{2})', 'i'));
+  const igv = field(text, new RegExp('\\bIGV\\s*:?\\s*' + CUR + '([\\d,]+\\.\\d{2})', 'i'));
+  const importeTotal = field(text, new RegExp('Importe Total\\s*:?\\s*' + CUR + '([\\d,]+\\.\\d{2})', 'i'));
   let son = field(text, /SON:?[ \t]*([^\n]*)/i);
   son = son.split(/\s{2,}/)[0].trim();
   const detraccionPct = field(text, /Porcentaje de detracci[oó]n:?\s*([\d.]+)/i);
@@ -508,62 +515,109 @@ function parseItemsSunat(text){
     .map(l => l.trim())
     .filter(Boolean);
 
-  // Hasta 8 decimales: algunas plantillas (y el OCR) imprimen el valor unitario
-  // sin redondear a 2 decimales (p.ej. 296.61016949).
-  const isNum = s => /^[\d,]+\.\d{2,8}$/.test(s);
+  // Quita un símbolo de moneda pegado al número ("$2.20339" -> "2.20339").
+  const stripCur = s => String(s).replace(/^(?:S\/\.?|US\$|\$|€)\s*/i, '').trim();
+  // Acepta enteros y decimales: unas plantillas imprimen el valor unitario sin
+  // decimales (510) y otras con muchos (42.3728813559 = 10 decimales).
+  const isNum = s => /^[\d,]+(?:\.\d{1,12})?$/.test(stripCur(s));
   // Unidades de medida conocidas (para separar "unidad" de "descripción" cuando ambas
   // quedan pegadas por falta de espacio amplio entre columnas en el PDF original).
   const KNOWN_UNITS = ['METRO CUBICO','METRO CUADRADO','KILOGRAMO','UNIDAD','SERVICIO','GALON','LITRO','HORA',
     'GLOBAL','JUEGO','PAQUETE','CIENTO','MILLAR','DOCENA','TONELADA','METRO','ROLLO','CAJA','BOLSA','PAR','PLIEGO']
     .sort((a,b) => b.length - a.length);
 
-  const items = [];
-  for(const line of block){
-    const startsAsItem = /^\d+(?:\.\d{1,4})?\s/.test(line);
-    if(startsAsItem){
-      const parts = line.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+  const isCantidad = s => /^\d+(?:\.\d{1,4})?$/.test(s);
+  // Un "1" solitario dentro de una celda ancha es un trazo fino y el OCR lo confunde
+  // con estos caracteres (todos son un único trazo vertical o un punto), así que en
+  // una fila de ítem se interpretan como el dígito 1.
+  const THIN_ONE = /^[!|lIij,.'¡\/\\]$/;
+  // Cualquier otro carácter suelto no alfanumérico en la 1a columna es una cantidad
+  // que el OCR no supo leer: la fila se conserva pero la cantidad se deja vacía para
+  // que se complete a mano (es preferible a descartar la línea entera).
+  const isMisreadCant = s => s.length === 1 && !/[A-Za-z0-9]/.test(s);
+  // Marcadores de "columna vacía" que el OCR devuelve para el código ausente.
+  const isDash = s => /^[-_—–]+$/.test(s);
 
-      if(parts.length >= 3 && /^\d+(?:\.\d{1,4})?$/.test(parts[0])){
-        // Camino normal: las columnas ya vienen separadas por espacios amplios.
-        let rest = parts.slice(1);
-        let valorUnitario = '';
-        if(rest.length && isNum(rest[rest.length - 1])){
-          if(rest.length >= 2 && isNum(rest[rest.length - 2])){
-            rest.pop(); // columna extra (p.ej. ICBPER), se descarta en este extractor de compras
-            valorUnitario = rest.pop();
-          } else {
-            valorUnitario = rest.pop();
-          }
+  const items = [];
+  // Cuando la celda de descripción es alta, el OCR emite sus líneas ANTES de la fila
+  // que trae cantidad/valor. Se acumulan aquí y se anteponen al ítem que venga.
+  let pendingDesc = [];
+  const takePending = () => { const p = pendingDesc.join(' ').trim(); pendingDesc = []; return p; };
+  const joinDesc = (pre, desc) => [pre, desc].filter(Boolean).join(' ').replace(/\s{2,}/g, ' ').trim();
+
+  for(const line of block){
+    const parts = line.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+    let startsAsItem = /^\d+(?:\.\d{1,4})?\s/.test(line);
+    let cantidad = null;
+
+    if(startsAsItem && parts.length && isCantidad(parts[0])){
+      cantidad = parts[0];
+    } else if(!startsAsItem && parts.length >= 4 && isMisreadCant(parts[0]) && isNum(parts[parts.length - 1])){
+      // Fila de ítem cuya cantidad el OCR leyó mal. Se exige forma de fila (varias
+      // columnas y un importe numérico al final) para no capturar por error una
+      // línea suelta de descripción.
+      startsAsItem = true;
+      cantidad = THIN_ONE.test(parts[0]) ? '1' : '';
+    }
+
+    if(startsAsItem && cantidad !== null && parts.length >= 3){
+      // Camino normal: las columnas ya vienen separadas por espacios amplios.
+      let rest = parts.slice(1);
+      let valorUnitario = '';
+      if(rest.length && isNum(rest[rest.length - 1])){
+        if(rest.length >= 2 && isNum(rest[rest.length - 2])){
+          rest.pop(); // columna extra (p.ej. ICBPER), se descarta en este extractor de compras
+          valorUnitario = stripCur(rest.pop());
+        } else {
+          valorUnitario = stripCur(rest.pop());
         }
-        let unidad = rest.length ? rest.shift() : '';
-        let middle = rest.join(' ').trim();
-        let codigo = '', descripcion = middle;
+      }
+      let unidad = rest.length ? rest.shift() : '';
+      if(rest.length && isDash(rest[0])) rest.shift(); // columna de código vacía
+      let codigo = '', descripcion = '';
+      if(rest.length >= 2){
+        // Código y descripción llegaron como columnas separadas: se respeta esa
+        // separación (el código puede ser puramente alfabético, p.ej. "ARTS").
+        codigo = rest[0];
+        descripcion = rest.slice(1).join(' ').trim();
+      } else if(rest.length === 1){
+        // Vinieron pegados en una sola columna: se separa por heurística.
+        const middle = rest[0];
         const codeMatch = middle.match(/^(\S*\d\S*)\s+(.+)$/);
         if(codeMatch && codeMatch[1].length <= 12){
           codigo = codeMatch[1];
           descripcion = codeMatch[2];
-        }
-        items.push({ cantidad: parts[0], unidad, codigo, descripcion, valorUnitario });
-      } else {
-        // Camino de respaldo: cantidad, unidad y descripción quedaron pegadas con un
-        // solo espacio (sin gaps de 2+). Se extrae con regex y se intenta reconocer
-        // la unidad de medida a partir de un listado conocido.
-        const m = line.match(/^(\d+(?:\.\d{1,4})?)\s+(.+?)\s+([\d,]+\.\d{2,8})\s*$/);
-        if(m){
-          const cantidad = m[1], middle = m[2], valorUnitario = m[3];
-          let unidad = '', descripcion = middle;
-          const upperMiddle = middle.toUpperCase();
-          const unitMatch = KNOWN_UNITS.find(u => upperMiddle.startsWith(u));
-          if(unitMatch){
-            unidad = middle.slice(0, unitMatch.length).trim();
-            descripcion = middle.slice(unitMatch.length).trim();
-          }
-          items.push({ cantidad, unidad, codigo: '', descripcion, valorUnitario });
+        } else {
+          descripcion = middle;
         }
       }
-    } else if(items.length){
-      items[items.length - 1].descripcion = (items[items.length - 1].descripcion + ' ' + line).trim();
+      items.push({ cantidad, unidad, codigo, descripcion: joinDesc(takePending(), descripcion), valorUnitario });
+    } else if(startsAsItem){
+      // Camino de respaldo: cantidad, unidad y descripción quedaron pegadas con un
+      // solo espacio (sin gaps de 2+). Se extrae con regex y se intenta reconocer
+      // la unidad de medida a partir de un listado conocido.
+      const m = line.match(/^(\d+(?:\.\d{1,4})?)\s+(.+?)\s+([\d,]+\.\d{2,12})\s*$/);
+      if(m){
+        const cant = m[1], middle = m[2], valorUnitario = m[3];
+        let unidad = '', descripcion = middle;
+        const upperMiddle = middle.toUpperCase();
+        const unitMatch = KNOWN_UNITS.find(u => upperMiddle.startsWith(u));
+        if(unitMatch){
+          unidad = middle.slice(0, unitMatch.length).trim();
+          descripcion = middle.slice(unitMatch.length).trim();
+        }
+        items.push({ cantidad: cant, unidad, codigo: '', descripcion: joinDesc(takePending(), descripcion), valorUnitario });
+      }
+    } else {
+      // Línea de descripción: pertenece a la fila de ítem que viene a continuación.
+      pendingDesc.push(line);
     }
+  }
+
+  // Lo que quede después del último ítem es continuación de su descripción.
+  if(pendingDesc.length && items.length){
+    const last = items[items.length - 1];
+    last.descripcion = joinDesc(last.descripcion, takePending());
   }
   return items;
 }
